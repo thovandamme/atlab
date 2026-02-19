@@ -1,7 +1,7 @@
 #include "tlab_error.h"
 
 module SpecialForcing
-    use TLab_Constants, only: wp, wi, pi_wp
+    use TLab_Constants, only: wp, wi, pi_wp, tag_scal
     use TLab_Constants, only: efile, lfile, MAX_VARS, MAX_PARS
     use TLab_WorkFlow, only: TLab_Write_ASCII, TLab_Stop
     use TLab_Memory, only: TLab_Allocate_Real
@@ -50,7 +50,9 @@ contains
     !########################################################################
     !########################################################################
     subroutine SpecialForcing_Initialize(inifile)
-        use TLab_Memory, only: imax, jmax, kmax
+        use TLab_Memory, only: imax, jmax, kmax, inb_scal
+        use IO_Fields, only: IO_Read_Fields
+        use TLab_Time, only: itime
 #ifdef USE_MPI
         use TLabMPI_VARS, only: ims_offset_i, ims_offset_j
 #endif
@@ -62,6 +64,7 @@ contains
         character(len=512) sRes
         integer(wi) idummy, i, j, k, iwave, idsp, jdsp
         real(wp) :: dummy(MAX_PARS), rx, ry, rz
+        real(wp) :: params(0)
 
         !########################################################################
         bakfile = trim(adjustl(inifile))//'.bak'
@@ -139,25 +142,41 @@ contains
         end if
 
         !########################################################################
-        ! Initialize the nevelope for the wave maker
+        !               Initialize the envelope for the wave maker
+        !########################################################################
+#ifdef USE_MPI
+        idsp = ims_offset_i; jdsp = ims_offset_j
+#else
+        idsp = 0; jdsp = 0
+#endif
+
         select case (forcingProps%type)
-        case (TYPE_WAVEMAKER)
+        case (TYPE_WAVEMAKER, TYPE_WAVEMAKERTANH)
             envelope(:) = 0.0_wp
             call ScanFile_Char(bakfile, inifile, block, 'Envelope', '1.0, 1.0, 1.0, 1.0, 1.0, 1.0', sRes) ! position and size
             idummy = MAX_PARS
             call LIST_REAL(sRes, idummy, envelope)
-            envelope(4) = abs(envelope(4))                              ! make sure the size parameter is positive
-            envelope(5) = abs(envelope(5))                              ! make sure the size parameter is positive
-            envelope(6) = abs(envelope(6))                              ! make sure the size parameter is positive
 
             call TLab_Allocate_Real(__FILE__, tmp_envelope, [imax, jmax, kmax], 'tmp-wave-envelope')
             call TLab_Allocate_Real(__FILE__, tmp_phase, [imax, kmax, nwaves], 'tmp-wave-phase')
 
-#ifdef USE_MPI
-            idsp = ims_offset_i; jdsp = ims_offset_j
-#else
-            idsp = 0; jdsp = 0
-#endif
+            ! Add a random perturbation to the envelope in order to support turbulence onset
+            ! forcingProps%parameters(2) = perturbation amplitude
+            if (forcingProps%parameters(2) < 1.0_wp .AND. forcingProps%parameters(2) > 0.0_wp) then
+                call IO_Read_Fields(trim(adjustl(tag_scal))//'rand', imax, jmax, kmax, itime, inb_scal, 1, tmp_envelope, params)
+                ! Normalize random field
+                tmp_envelope = tmp_envelope/max(abs(maxval(tmp_envelope)), abs(minval(tmp_envelope)))
+                tmp_envelope = tmp_envelope*forcingProps%parameters(2)
+            end if
+        end select
+
+        select case (forcingProps%type)
+        case (TYPE_WAVEMAKER)
+            ! envelope(1:3) are postions in x, y, and z
+
+            envelope(4) = abs(envelope(4)) ! make sure the size parameter is positive
+            envelope(5) = abs(envelope(5)) ! make sure the size parameter is positive
+            envelope(6) = abs(envelope(6)) ! make sure the size parameter is positive
 
             dummy(1) = 0.5_wp/envelope(4)**2.0_wp ! width in x-direction
             dummy(2) = 0.5_wp/envelope(5)**2.0_wp ! width y-direction
@@ -169,7 +188,7 @@ contains
                         rx = x%nodes(idsp + i) - envelope(1)
                         ry = y%nodes(jdsp + j) - envelope(2)
                         rz = z%nodes(k) - envelope(3)
-                        tmp_envelope(i, j, k) = exp(- dummy(1)*rx*rx - dummy(2)*ry*ry - dummy(3)*rz*rz)
+                        tmp_envelope(i, j, k) = (tmp_envelope(i, j, k) + 1.0_wp)*exp(- dummy(1)*rx*rx - dummy(2)*ry*ry - dummy(3)*rz*rz)
                         do iwave = 1, nwaves
                             tmp_phase(i, k, iwave) = rx*wavenumber(1, iwave) + rz*wavenumber(3, iwave)
                         end do
@@ -182,30 +201,19 @@ contains
 
         case (TYPE_WAVEMAKERTANH)
             ! Tanh profile for wave maker envelope only a function of z
-            ! enveleope has only two parameters: inflection point position and width
+            ! envelope has only two parameters: inflection point position and width
             ! Tanh profile thus only for simulating a horizontally plane wave
-            envelope(:) = 0.0_wp
-            call ScanFile_Char(bakfile, inifile, block, 'EnvelopeTanh', '1.0, 1.0, 0.0, 0.0, 0.0, 0.0', sRes)
-            idummy = MAX_PARS
-            call LIST_REAL(sRes, idummy, envelope)
-            envelope(1) = envelope(1)                              ! position of inflection point
-            envelope(2) = envelope(2)                              ! profile width
+            
+            ! envelope(1) is position of inflection point
+            ! envelope(2) is profile width
 
-            call TLab_Allocate_Real(__FILE__, tmp_envelope, [imax, jmax, kmax], 'tmp-wave-envelope')
-            call TLab_Allocate_Real(__FILE__, tmp_phase, [imax, kmax, nwaves], 'tmp-wave-phase')
-
-#ifdef USE_MPI
-            idsp = ims_offset_i; jdsp = ims_offset_j
-#else
-            idsp = 0; jdsp = 0
-#endif
             do k = 1, kmax
                 do j = 1, jmax
                     do i = 1, imax
                         rx = x%nodes(idsp + i) - envelope(1)
                         ry = y%nodes(jdsp + j) - envelope(2)
                         rz = z%nodes(k) - envelope(3)
-                        tmp_envelope(i, j, k) = 0.5*(1.0 + tanh((z%nodes(k) - envelope(1))/(2.0*envelope(2))))
+                        tmp_envelope(i, j, k) = (tmp_envelope(i, j, k) + 1.0_wp)*0.5*(1.0 + tanh((z%nodes(k) - envelope(1))/(2.0*envelope(2))))
                         do iwave = 1, nwaves
                             tmp_phase(i, k, iwave) = rx*wavenumber(1, iwave) + rz*wavenumber(3, iwave)
                         end do
